@@ -46,11 +46,16 @@ two talk over localhost and nothing is exposed on the network.
 Safety rules:
 
 - plugpool only switches the plugs in its configuration.
+- Each plug powers one machine; the configuration is rejected if two nodes
+  share a plug.
 - A plug goes off only for a node cluster-autoscaler asked to delete or to
-  drop from the target size. A registered, Ready node without
-  cluster-autoscaler's `ToBeDeletedByClusterAutoscaler` taint is never shut
-  down or switched off, whatever the request: this is checked before the
-  shutdown and again before the plug goes off.
+  drop from the target size. A registered node without cluster-autoscaler's
+  `ToBeDeletedByClusterAutoscaler` taint is never shut down or switched
+  off, whatever the request: this is checked before the shutdown and before
+  every plug-off attempt (a machine that registers meanwhile keeps its
+  power).
+- The Node is deleted only after its poweroff pod is removed; until then
+  the machine is not used for a scale-up.
 - A node matches its instance by `spec.providerID`; by name only when the
   node has no providerID. A providerID of another form is logged as a
   configuration error.

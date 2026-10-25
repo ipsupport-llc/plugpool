@@ -31,12 +31,19 @@ type fakePlug struct {
 	readErr error
 	setErrs int  // fail this many Set calls first
 	hang    bool // State blocks until ctx is done
+	// onState runs at the start of each State call (test hooks).
+	onState func()
+	// onSetErr runs after each failed Set (test hooks).
+	onSetErr func()
 }
 
 func (p *fakePlug) State(ctx context.Context) (bool, error) {
 	p.mu.Lock()
-	hang := p.hang
+	hang, hook := p.hang, p.onState
 	p.mu.Unlock()
+	if hook != nil {
+		hook()
+	}
 	if hang {
 		<-ctx.Done()
 		return false, ctx.Err()
@@ -48,11 +55,16 @@ func (p *fakePlug) State(ctx context.Context) (bool, error) {
 
 func (p *fakePlug) Set(_ context.Context, on bool) error {
 	p.mu.Lock()
-	defer p.mu.Unlock()
 	if p.setErrs > 0 {
 		p.setErrs--
+		hook := p.onSetErr
+		p.mu.Unlock()
+		if hook != nil {
+			hook()
+		}
 		return errors.New("plug unreachable")
 	}
+	defer p.mu.Unlock()
 	p.on = on
 	if on {
 		p.log.add("plug on " + p.name)
@@ -78,8 +90,8 @@ type fakeCluster struct {
 	powerOffUntaints bool
 	// gate, when set, blocks StartPowerOff until closed.
 	gate chan struct{}
-	// deleteErr fails DeleteNode.
-	deleteErr error
+	// deleteErr fails DeleteNode; removeErr fails RemovePowerOff.
+	deleteErr, removeErr error
 }
 
 func (c *fakeCluster) Node(_ context.Context, name string) (NodeInfo, error) {
@@ -123,6 +135,10 @@ func (c *fakeCluster) StartPowerOff(_ context.Context, name string) error {
 }
 
 func (c *fakeCluster) RemovePowerOff(_ context.Context, name string) error {
+	if c.removeErr != nil {
+		c.log.add("remove poweroff failed " + name)
+		return c.removeErr
+	}
 	c.log.add("remove poweroff " + name)
 	return nil
 }

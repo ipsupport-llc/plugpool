@@ -200,3 +200,20 @@ func mapsEqual(a, b map[string]State) bool {
 	}
 	return true
 }
+
+func TestRefreshDoesNotOverwriteConcurrentChange(t *testing.T) {
+	r := newRig("w1", "w2")
+	_ = r.pool.Refresh(ctx) // both Off
+	w1read := make(chan struct{})
+	r.plugs["w1"].onState = func() { close(w1read) }
+	r.plugs["w2"].onState = func() {
+		<-w1read                                            // w1 already observed Off
+		if err := r.pool.IncreaseSize(ctx, 1); err != nil { // switches w1 on
+			t.Error(err)
+		}
+	}
+	_ = r.pool.Refresh(ctx)
+	if got := states(r)["k3s://w1"]; got != Creating {
+		t.Fatalf("w1 = %v after a concurrent scale-up, want Creating", got)
+	}
+}

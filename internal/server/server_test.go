@@ -65,7 +65,7 @@ func (c *cluster) StartPowerOff(_ context.Context, n string) error {
 
 type instantClock struct{}
 
-func (instantClock) Now() time.Time                                { return time.Unix(0, 0) }
+func (instantClock) Now() time.Time                                   { return time.Unix(0, 0) }
 func (instantClock) Sleep(ctx context.Context, _ time.Duration) error { return ctx.Err() }
 
 type env struct {

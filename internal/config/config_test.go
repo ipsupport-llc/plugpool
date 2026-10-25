@@ -67,6 +67,7 @@ func TestValidate(t *testing.T) {
 		{"non http url", `url: "ftp://plug-worker-1.example"`, "url"},
 		{"no namespace", "namespace: \"\"", "namespace"},
 		{"no image", "image: \"\"", "image"},
+		{"shared plug", "sharedplug", "same plug"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -92,6 +93,8 @@ func mutate(s, edit string) string {
 		return s + s[i:]
 	case "dupnode":
 		return strings.Replace(s, "worker-2, plug", "worker-1, plug", 1)
+	case "sharedplug":
+		return strings.Replace(s, "http://plug-worker-2.example", "http://PLUG-worker-1.example/", 1)
 	case "nodeGroups: []":
 		return s[:strings.Index(s, "nodeGroups:")] + edit + "\n"
 	}

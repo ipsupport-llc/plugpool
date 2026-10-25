@@ -194,3 +194,52 @@ func TestDeleteNodeFailureKeepsRunning(t *testing.T) {
 		t.Fatalf("w1 = %v after a failed Node delete, want Running", got)
 	}
 }
+
+func TestDeleteNotReadyUntaintedAborts(t *testing.T) {
+	r := newRig("w1")
+	r.plugs["w1"].on = true
+	r.cluster.nodes["w1"] = &fakeNode{ready: false} // registered, not marked by CA
+	_ = r.pool.Refresh(ctx)
+	_ = r.pool.DeleteNodes(ctx, []string{"w1"})
+	r.pool.Wait()
+	if got := r.log.all(); len(got) != 0 {
+		t.Fatalf("an existing node without the deletion taint was touched: %v", got)
+	}
+}
+
+func TestPlugOffRetryRechecksNode(t *testing.T) {
+	r := newRig("w1")
+	r.plugs["w1"].on = true
+	_ = r.pool.Refresh(ctx) // Creating, no Node
+	registered := make(chan struct{})
+	r.plugs["w1"].setErrs = 1
+	r.plugs["w1"].onSetErr = func() {
+		r.cluster.mu.Lock()
+		r.cluster.nodes["w1"] = &fakeNode{ready: true} // the machine registered meanwhile
+		r.cluster.mu.Unlock()
+		close(registered)
+	}
+	_ = r.pool.DeleteNodes(ctx, []string{"w1"})
+	r.pool.Wait()
+	<-registered
+	if got := r.log.all(); len(got) != 0 {
+		t.Fatalf("plug cut after the machine registered untainted: %v", got)
+	}
+}
+
+func TestRemovePowerOffFailureBlocksReuse(t *testing.T) {
+	r := newRig("w1")
+	running(r, "w1", false)
+	r.cluster.removeErr = errors.New("forbidden")
+	_ = r.pool.Refresh(ctx)
+	_ = r.pool.DeleteNodes(ctx, []string{"w1"})
+	r.pool.Wait()
+	for _, c := range r.log.all() {
+		if c == "delete node w1" {
+			t.Fatal("Node deleted although its poweroff pod could not be removed")
+		}
+	}
+	if got := states(r)["k3s://w1"]; got != Running {
+		t.Fatalf("w1 = %v, want Running (not reusable for scale-up)", got)
+	}
+}

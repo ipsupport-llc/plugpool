@@ -108,9 +108,14 @@ type Pool struct {
 	last      map[string]State
 	poweredOn map[string]time.Time // when IncreaseSize switched a plug on
 	deleting  map[string]bool
-	wg        sync.WaitGroup
-	stop      context.Context
-	cancel    context.CancelFunc
+	// gen counts state changes made by RPCs and scale-downs; changed holds
+	// each node's last one, so a Refresh never overwrites a change made
+	// after it started reading.
+	gen     uint64
+	changed map[string]uint64
+	wg      sync.WaitGroup
+	stop    context.Context
+	cancel  context.CancelFunc
 }
 
 // New returns the pool of group g. plugs has one switch per node name.
@@ -120,7 +125,8 @@ func New(g config.NodeGroup, p config.PowerOff, prefix string, plugs map[string]
 		group: g, powerOff: p, prefix: prefix, plugs: plugs, cluster: c, clock: clk,
 		plugTimeout: defaultPlugTimeout,
 		last:        map[string]State{}, poweredOn: map[string]time.Time{}, deleting: map[string]bool{},
-		stop: stop, cancel: cancel,
+		changed: map[string]uint64{},
+		stop:    stop, cancel: cancel,
 	}
 	for _, n := range g.Nodes {
 		pl.last[n.Name] = Unknown
@@ -137,6 +143,9 @@ func (p *Pool) Group() config.NodeGroup { return p.group }
 // only logged: a failing Refresh would stop cluster-autoscaler entirely, so
 // one unreachable plug must not fail it.
 func (p *Pool) Refresh(ctx context.Context) error {
+	p.mu.Lock()
+	start := p.gen
+	p.mu.Unlock()
 	type result struct {
 		name    string
 		node    NodeInfo
@@ -168,6 +177,8 @@ func (p *Pool) Refresh(ctx context.Context) error {
 	defer p.mu.Unlock()
 	for _, r := range results {
 		switch {
+		case p.changed[r.name] > start:
+			// changed while we were reading: our observation is stale
 		case p.deleting[r.name]:
 			p.last[r.name] = Deleting
 		case r.nodeErr != nil:
@@ -255,7 +266,7 @@ func (p *Pool) IncreaseSize(ctx context.Context, delta int) error {
 			errs = append(errs, fmt.Errorf("power on %s: %w", name, err))
 			continue
 		}
-		p.last[name] = Creating
+		p.setState(name, Creating)
 		p.poweredOn[name] = p.clock.Now()
 		done++
 		slog.Info("plug switched on", "pool", p.group.ID, "node", name, "reason", "scale-up")
@@ -298,7 +309,8 @@ func (p *Pool) DecreaseTargetSize(ctx context.Context, delta int) error {
 			continue
 		}
 		if info.Exists {
-			p.last[name] = Running
+			p.setState(name, Running)
+			delete(p.poweredOn, name)
 			continue
 		}
 		pctx, cancel := context.WithTimeout(ctx, p.plugTimeout)
@@ -308,7 +320,7 @@ func (p *Pool) DecreaseTargetSize(ctx context.Context, delta int) error {
 			errs = append(errs, fmt.Errorf("power off %s: %w", name, err))
 			continue
 		}
-		p.last[name] = Off
+		p.setState(name, Off)
 		delete(p.poweredOn, name)
 		done++
 		slog.Info("plug switched off", "pool", p.group.ID, "node", name, "reason", "target size decreased")
@@ -317,6 +329,13 @@ func (p *Pool) DecreaseTargetSize(ctx context.Context, delta int) error {
 		return fmt.Errorf("pool %s: dropped %d of %d unregistered nodes (the others registered or failed): %v", p.group.ID, done, want, errors.Join(errs...))
 	}
 	return nil
+}
+
+// setState records a state change made by an RPC or a scale-down (p.mu held).
+func (p *Pool) setState(name string, s State) {
+	p.gen++
+	p.changed[name] = p.gen
+	p.last[name] = s
 }
 
 // NodeFor returns the pool node a Kubernetes node is: by providerID, or by

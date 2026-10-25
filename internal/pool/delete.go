@@ -39,7 +39,7 @@ func (p *Pool) DeleteNodes(ctx context.Context, names []string) error {
 			continue
 		}
 		p.deleting[name] = true
-		p.last[name] = Deleting
+		p.setState(name, Deleting)
 		p.wg.Add(1)
 		go p.scaleDown(name)
 	}
@@ -59,10 +59,11 @@ func (p *Pool) Stop() {
 // scaleDown powers a node off: shutdown through the poweroff pod, NotReady
 // (or notReadyTimeout), grace, plug off, poweroff pod removed, Node deleted.
 // A node without a Node object (it never registered) goes straight to plug
-// off. A Ready node that cluster-autoscaler has not tainted for deletion is
-// never touched: the sequence aborts (checked before the shutdown and again
-// before the plug goes off), so a stray or late DeleteNodes cannot cut a
-// node that runs workloads.
+// off. A registered node that cluster-autoscaler has not tainted for
+// deletion is never touched: the sequence aborts (checked before the
+// shutdown and before every plug-off attempt), so a stray or late
+// DeleteNodes cannot cut a node that runs workloads, nor a machine that
+// registered meanwhile.
 func (p *Pool) scaleDown(name string) {
 	defer p.wg.Done()
 	ctx := p.stop
@@ -84,11 +85,11 @@ func (p *Pool) scaleDown(name string) {
 		if p.clock.Sleep(ctx, p.powerOff.Grace.Duration) != nil {
 			return
 		}
+	}
+	for {
 		if info, ok = p.checkNode(ctx, log, name, "before plug off"); !ok {
 			return
 		}
-	}
-	for {
 		pctx, cancel := context.WithTimeout(ctx, p.plugTimeout)
 		err := p.plugs[name].Set(pctx, false)
 		cancel()
@@ -103,10 +104,13 @@ func (p *Pool) scaleDown(name string) {
 	}
 	state := Off
 	if info.Exists {
-		if err := p.cluster.RemovePowerOff(ctx, name); err != nil {
-			log.Warn("poweroff pod not removed", "err", err)
-		}
-		if err := p.deleteNode(ctx, name); err != nil {
+		// A poweroff pod left bound to the node would shut the machine down
+		// again on its next boot: until it is gone, keep the Node and the
+		// state Running, so the machine is not picked for a scale-up.
+		if err := p.retry(ctx, func() error { return p.cluster.RemovePowerOff(ctx, name) }); err != nil {
+			log.Warn("poweroff pod not removed; keeping the Node", "err", err)
+			state = Running
+		} else if err := p.retry(ctx, func() error { return p.cluster.DeleteNode(ctx, name) }); err != nil {
 			log.Warn("node delete failed; the Node stays registered", "err", err)
 			state = Running
 		} else {
@@ -126,22 +130,23 @@ func (p *Pool) checkNode(ctx context.Context, log *slog.Logger, name, when strin
 		p.finish(name, Running)
 		return info, false
 	}
-	if info.Exists && info.Ready && !info.ToBeDeleted {
-		log.Warn("node is Ready and not marked for deletion by cluster-autoscaler, aborting the scale-down", "when", when)
+	if info.Exists && !info.ToBeDeleted {
+		log.Warn("node is registered and not marked for deletion by cluster-autoscaler, aborting the scale-down", "when", when)
 		p.finish(name, Running)
 		return info, false
 	}
 	return info, true
 }
 
-func (p *Pool) deleteNode(ctx context.Context, name string) error {
+// retry runs f up to nodeDeleteRetries times, plugRetryPeriod apart.
+func (p *Pool) retry(ctx context.Context, f func() error) error {
 	var err error
-	for range nodeDeleteRetries {
-		if err = p.cluster.DeleteNode(ctx, name); err == nil {
+	for i := range nodeDeleteRetries {
+		if err = f(); err == nil {
 			return nil
 		}
-		if p.clock.Sleep(ctx, plugRetryPeriod) != nil {
-			return err
+		if i == nodeDeleteRetries-1 || p.clock.Sleep(ctx, plugRetryPeriod) != nil {
+			break
 		}
 	}
 	return err
@@ -155,7 +160,7 @@ func (p *Pool) finish(name string, s State) {
 	if s == Off {
 		delete(p.poweredOn, name)
 	}
-	p.last[name] = s
+	p.setState(name, s)
 }
 
 // waitNotReady polls until the node is NotReady or gone, up to

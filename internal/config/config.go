@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/url"
 	"os"
+	"strings"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -120,6 +121,7 @@ func (c *Config) Validate() error {
 	}
 	groups := map[string]bool{}
 	nodes := map[string]bool{}
+	plugs := map[string]string{} // normalized plug URL + switch => node
 	for _, g := range c.NodeGroups {
 		p := fmt.Sprintf("nodeGroups[%s]", g.ID)
 		if g.ID == "" {
@@ -154,6 +156,15 @@ func (c *Config) Validate() error {
 			}
 			if n.Plug.Switch == "" {
 				errs = append(errs, fmt.Errorf("%s: node %s: plug.switch is required", p, n.Name))
+			}
+			// One plug powers one machine: switching it off for one node
+			// must never cut another.
+			if err == nil {
+				key := strings.ToLower(u.Scheme+"://"+u.Host) + strings.TrimSuffix(u.Path, "/") + "#" + n.Plug.Switch
+				if other, dup := plugs[key]; dup {
+					errs = append(errs, fmt.Errorf("%s: nodes %s and %s use the same plug", p, other, n.Name))
+				}
+				plugs[key] = n.Name
 			}
 		}
 	}
