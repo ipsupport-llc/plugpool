@@ -16,15 +16,31 @@ import (
 	"github.com/ipsupport-llc/plugpool/internal/plug"
 )
 
+// NodeInfo is what the pool reads from a Node object.
+type NodeInfo struct {
+	Exists bool
+	Ready  bool
+	// ToBeDeleted: cluster-autoscaler's ToBeDeletedByClusterAutoscaler taint
+	// is on the node, i.e. it has drained it for removal.
+	ToBeDeleted bool
+	ProviderID  string
+}
+
 // Cluster is what the pool needs from Kubernetes.
 type Cluster interface {
-	// Node reports whether the Node object exists and is Ready.
-	Node(ctx context.Context, name string) (exists, ready bool, err error)
+	// Node reads the Node object; Exists is false when it is absent.
+	Node(ctx context.Context, name string) (NodeInfo, error)
 	// DeleteNode deletes the Node object; an absent node is not an error.
 	DeleteNode(ctx context.Context, name string) error
 	// StartPowerOff starts the shutdown of the node's machine; idempotent.
 	StartPowerOff(ctx context.Context, name string) error
+	// RemovePowerOff deletes the node's poweroff pods.
+	RemovePowerOff(ctx context.Context, name string) error
 }
+
+// defaultPlugTimeout bounds one plug request made while serving an RPC;
+// cluster-autoscaler's externalgrpc deadline is a few seconds.
+const defaultPlugTimeout = 3 * time.Second
 
 // Clock is time, injectable for tests.
 type Clock interface {
@@ -63,13 +79,15 @@ const (
 	Running
 	// Deleting: the scale-down sequence is running.
 	Deleting
+	// Unknown: no Node object and the plug has never been read.
+	Unknown
 )
 
 func (s State) String() string {
-	return [...]string{"Off", "Creating", "Running", "Deleting"}[s]
+	return [...]string{"Off", "Creating", "Running", "Deleting", "Unknown"}[s]
 }
 
-// Instance is a pool node that is not Off.
+// Instance is a pool node that is not Off or Unknown.
 type Instance struct {
 	ID    string
 	State State
@@ -83,6 +101,8 @@ type Pool struct {
 	plugs    map[string]plug.Switch
 	cluster  Cluster
 	clock    Clock
+	// plugTimeout bounds each plug request made while serving an RPC.
+	plugTimeout time.Duration
 
 	mu        sync.Mutex
 	last      map[string]State
@@ -96,55 +116,76 @@ type Pool struct {
 // New returns the pool of group g. plugs has one switch per node name.
 func New(g config.NodeGroup, p config.PowerOff, prefix string, plugs map[string]plug.Switch, c Cluster, clk Clock) *Pool {
 	stop, cancel := context.WithCancel(context.Background())
-	return &Pool{
+	pl := &Pool{
 		group: g, powerOff: p, prefix: prefix, plugs: plugs, cluster: c, clock: clk,
-		last: map[string]State{}, poweredOn: map[string]time.Time{}, deleting: map[string]bool{},
+		plugTimeout: defaultPlugTimeout,
+		last:        map[string]State{}, poweredOn: map[string]time.Time{}, deleting: map[string]bool{},
 		stop: stop, cancel: cancel,
 	}
+	for _, n := range g.Nodes {
+		pl.last[n.Name] = Unknown
+	}
+	return pl
 }
 
 // Group is the pool's configuration.
 func (p *Pool) Group() config.NodeGroup { return p.group }
 
 // Refresh re-reads every node's Node object and, for nodes without one, its
-// plug. A read error keeps the node's last state. It fails only when no plug
-// it had to read could be read.
+// plug. The reads run in parallel and outside the lock, each plug read
+// bounded by plugTimeout. A read error keeps the node's last state and is
+// only logged: a failing Refresh would stop cluster-autoscaler entirely, so
+// one unreachable plug must not fail it.
 func (p *Pool) Refresh(ctx context.Context) error {
+	type result struct {
+		name    string
+		node    NodeInfo
+		nodeErr error
+		on      bool
+		plugErr error
+		read    bool // plug was read
+	}
+	results := make([]result, len(p.group.Nodes))
+	var wg sync.WaitGroup
+	for i, n := range p.group.Nodes {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			r := result{name: n.Name}
+			r.node, r.nodeErr = p.cluster.Node(ctx, n.Name)
+			if r.nodeErr == nil && !r.node.Exists {
+				pctx, cancel := context.WithTimeout(ctx, p.plugTimeout)
+				r.on, r.plugErr = p.plugs[n.Name].State(pctx)
+				cancel()
+				r.read = true
+			}
+			results[i] = r
+		}()
+	}
+	wg.Wait()
+
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	var plugReads, plugErrs int
-	var lastErr error
-	for _, n := range p.group.Nodes {
-		if p.deleting[n.Name] {
-			p.last[n.Name] = Deleting
-			continue
+	for _, r := range results {
+		switch {
+		case p.deleting[r.name]:
+			p.last[r.name] = Deleting
+		case r.nodeErr != nil:
+			slog.Warn("node read failed, keeping last state", "node", r.name, "err", r.nodeErr)
+		case r.node.Exists:
+			if r.node.ProviderID != "" && r.node.ProviderID != p.prefix+r.name {
+				slog.Error("node providerID does not match providerIDPrefix + name; cluster-autoscaler will not match it to its instance",
+					"node", r.name, "providerID", r.node.ProviderID, "expected", p.prefix+r.name)
+			}
+			p.last[r.name] = Running
+		case r.plugErr != nil:
+			slog.Warn("plug read failed, keeping last state", "node", r.name, "state", p.last[r.name], "err", r.plugErr)
+		case r.on:
+			p.last[r.name] = Creating
+		default:
+			p.last[r.name] = Off
+			delete(p.poweredOn, r.name)
 		}
-		exists, _, err := p.cluster.Node(ctx, n.Name)
-		if err != nil {
-			slog.Warn("node read failed, keeping last state", "node", n.Name, "err", err)
-			continue
-		}
-		if exists {
-			p.last[n.Name] = Running
-			continue
-		}
-		plugReads++
-		on, err := p.plugs[n.Name].State(ctx)
-		if err != nil {
-			plugErrs++
-			lastErr = err
-			slog.Warn("plug read failed, keeping last state", "node", n.Name, "err", err)
-			continue
-		}
-		if on {
-			p.last[n.Name] = Creating
-		} else {
-			p.last[n.Name] = Off
-			delete(p.poweredOn, n.Name)
-		}
-	}
-	if plugReads > 0 && plugErrs == plugReads {
-		return fmt.Errorf("pool %s: no plug readable: %w", p.group.ID, lastErr)
 	}
 	return nil
 }
@@ -166,20 +207,22 @@ func (p *Pool) targetSize() int {
 	return n
 }
 
-// Instances lists every node that is not Off, in config order.
+// Instances lists every node that is not Off or Unknown, in config order.
 func (p *Pool) Instances() []Instance {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	var out []Instance
 	for _, n := range p.group.Nodes {
-		if s := p.last[n.Name]; s != Off {
+		if s := p.last[n.Name]; s != Off && s != Unknown {
 			out = append(out, Instance{ID: p.prefix + n.Name, State: s})
 		}
 	}
 	return out
 }
 
-// IncreaseSize switches on the plugs of the first delta Off nodes.
+// IncreaseSize switches on the plugs of delta Off nodes, in config order.
+// A plug that fails is skipped for the next Off node; nodes whose plug was
+// never read (Unknown) are not candidates.
 func (p *Pool) IncreaseSize(ctx context.Context, delta int) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -196,21 +239,37 @@ func (p *Pool) IncreaseSize(ctx context.Context, delta int) error {
 		}
 	}
 	if len(off) < delta {
-		return fmt.Errorf("pool %s: %d nodes off, %d requested", p.group.ID, len(off), delta)
+		return fmt.Errorf("pool %s: %d nodes known to be off, %d requested", p.group.ID, len(off), delta)
 	}
-	for _, name := range off[:delta] {
-		if err := p.plugs[name].Set(ctx, true); err != nil {
-			return fmt.Errorf("pool %s: power on %s: %w", p.group.ID, name, err)
+	done := 0
+	var errs []error
+	for _, name := range off {
+		if done == delta {
+			break
+		}
+		pctx, cancel := context.WithTimeout(ctx, p.plugTimeout)
+		err := p.plugs[name].Set(pctx, true)
+		cancel()
+		if err != nil {
+			slog.Warn("power on failed, trying the next node", "pool", p.group.ID, "node", name, "err", err)
+			errs = append(errs, fmt.Errorf("power on %s: %w", name, err))
+			continue
 		}
 		p.last[name] = Creating
 		p.poweredOn[name] = p.clock.Now()
+		done++
 		slog.Info("plug switched on", "pool", p.group.ID, "node", name, "reason", "scale-up")
+	}
+	if done < delta {
+		return fmt.Errorf("pool %s: powered on %d of %d: %w", p.group.ID, done, delta, errors.Join(errs...))
 	}
 	return nil
 }
 
 // DecreaseTargetSize switches off -delta Creating nodes, the most recently
-// powered on first. delta is negative, as cluster-autoscaler passes it.
+// powered on first. delta is negative, as cluster-autoscaler passes it. Each
+// node's Node object is read again first: a machine that registered since
+// the last Refresh keeps its power.
 func (p *Pool) DecreaseTargetSize(ctx context.Context, delta int) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -227,28 +286,48 @@ func (p *Pool) DecreaseTargetSize(ctx context.Context, delta int) error {
 		return fmt.Errorf("pool %s: only %d nodes not yet registered, asked to drop %d", p.group.ID, len(creating), -delta)
 	}
 	slices.SortStableFunc(creating, func(a, b string) int { return p.poweredOn[b].Compare(p.poweredOn[a]) })
+	want, done := -delta, 0
 	var errs []error
-	for _, name := range creating[:-delta] {
-		if err := p.plugs[name].Set(ctx, false); err != nil {
+	for _, name := range creating {
+		if done == want {
+			break
+		}
+		info, err := p.cluster.Node(ctx, name)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("read node %s: %w", name, err))
+			continue
+		}
+		if info.Exists {
+			p.last[name] = Running
+			continue
+		}
+		pctx, cancel := context.WithTimeout(ctx, p.plugTimeout)
+		err = p.plugs[name].Set(pctx, false)
+		cancel()
+		if err != nil {
 			errs = append(errs, fmt.Errorf("power off %s: %w", name, err))
 			continue
 		}
 		p.last[name] = Off
 		delete(p.poweredOn, name)
+		done++
 		slog.Info("plug switched off", "pool", p.group.ID, "node", name, "reason", "target size decreased")
 	}
-	return errors.Join(errs...)
+	if done < want {
+		return fmt.Errorf("pool %s: dropped %d of %d unregistered nodes (the others registered or failed): %v", p.group.ID, done, want, errors.Join(errs...))
+	}
+	return nil
 }
 
-// NodeFor returns the pool node a Kubernetes node is: by providerID, else by name.
+// NodeFor returns the pool node a Kubernetes node is: by providerID, or by
+// name when the node has no providerID. A node whose providerID has another
+// form is not a pool node, even with a matching name.
 func (p *Pool) NodeFor(providerID, name string) (string, bool) {
 	for _, n := range p.group.Nodes {
 		if providerID != "" && providerID == p.prefix+n.Name {
 			return n.Name, true
 		}
-	}
-	for _, n := range p.group.Nodes {
-		if name != "" && name == n.Name {
+		if providerID == "" && name != "" && name == n.Name {
 			return n.Name, true
 		}
 	}

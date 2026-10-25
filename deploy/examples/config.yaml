@@ -6,8 +6,10 @@ metadata:
 data:
   # cluster-autoscaler's externalgrpc cloud config: plugpool is a sidecar
   # in the same pod, so plain gRPC on localhost.
+  # grpc_timeout above the default 5s: a Refresh reads every plug.
   cloud-config.yaml: |
     address: 127.0.0.1:8086
+    grpc_timeout: 15s
   plugpool.yaml: |
     listen: 127.0.0.1:8086
     powerOff:

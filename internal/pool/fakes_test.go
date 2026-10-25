@@ -29,10 +29,18 @@ type fakePlug struct {
 	mu      sync.Mutex
 	on      bool
 	readErr error
-	setErrs int // fail this many Set calls first
+	setErrs int  // fail this many Set calls first
+	hang    bool // State blocks until ctx is done
 }
 
-func (p *fakePlug) State(context.Context) (bool, error) {
+func (p *fakePlug) State(ctx context.Context) (bool, error) {
+	p.mu.Lock()
+	hang := p.hang
+	p.mu.Unlock()
+	if hang {
+		<-ctx.Done()
+		return false, ctx.Err()
+	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return p.on, p.readErr
@@ -54,7 +62,11 @@ func (p *fakePlug) Set(_ context.Context, on bool) error {
 	return nil
 }
 
-type fakeNode struct{ ready bool }
+type fakeNode struct {
+	ready      bool
+	tainted    bool // ToBeDeletedByClusterAutoscaler
+	providerID string
+}
 
 type fakeCluster struct {
 	log   *log
@@ -62,23 +74,31 @@ type fakeCluster struct {
 	nodes map[string]*fakeNode
 	// powerOffMakesNotReady: StartPowerOff turns the node NotReady.
 	powerOffMakesNotReady bool
+	// powerOffUntaints: StartPowerOff removes the deletion taint (CA gave up).
+	powerOffUntaints bool
 	// gate, when set, blocks StartPowerOff until closed.
 	gate chan struct{}
+	// deleteErr fails DeleteNode.
+	deleteErr error
 }
 
-func (c *fakeCluster) Node(_ context.Context, name string) (bool, bool, error) {
+func (c *fakeCluster) Node(_ context.Context, name string) (NodeInfo, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	n, ok := c.nodes[name]
 	if !ok {
-		return false, false, nil
+		return NodeInfo{}, nil
 	}
-	return true, n.ready, nil
+	return NodeInfo{Exists: true, Ready: n.ready, ToBeDeleted: n.tainted, ProviderID: n.providerID}, nil
 }
 
 func (c *fakeCluster) DeleteNode(_ context.Context, name string) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if c.deleteErr != nil {
+		c.log.add("delete node failed " + name)
+		return c.deleteErr
+	}
 	delete(c.nodes, name)
 	c.log.add("delete node " + name)
 	return nil
@@ -91,9 +111,19 @@ func (c *fakeCluster) StartPowerOff(_ context.Context, name string) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.log.add("poweroff " + name)
-	if n, ok := c.nodes[name]; ok && c.powerOffMakesNotReady {
-		n.ready = false
+	if n, ok := c.nodes[name]; ok {
+		if c.powerOffMakesNotReady {
+			n.ready = false
+		}
+		if c.powerOffUntaints {
+			n.tainted = false
+		}
 	}
+	return nil
+}
+
+func (c *fakeCluster) RemovePowerOff(_ context.Context, name string) error {
+	c.log.add("remove poweroff " + name)
 	return nil
 }
 
@@ -135,5 +165,6 @@ func newRig(names ...string) *rig {
 	po.NotReadyTimeout.Duration = 5 * time.Minute
 	po.Grace.Duration = 2 * time.Minute
 	r.pool = New(g, po, "k3s://", switches, r.cluster, r.clock)
+	r.pool.plugTimeout = 50 * time.Millisecond
 	return r
 }

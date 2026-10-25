@@ -3,9 +3,12 @@ package kube
 import (
 	"context"
 	"slices"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/ipsupport-llc/plugpool/internal/config"
+	"github.com/ipsupport-llc/plugpool/internal/pool"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes/fake"
@@ -28,15 +31,22 @@ func newCluster(objs ...*corev1.Node) (*Cluster, *fake.Clientset) {
 	return New(cs, config.PowerOff{Namespace: "plugpool", Image: "busybox:1.37"}), cs
 }
 
-func TestNodeReadyAbsent(t *testing.T) {
-	c, _ := newCluster(node("up", corev1.ConditionTrue), node("down", corev1.ConditionUnknown))
+func TestNodeInfo(t *testing.T) {
+	up := node("up", corev1.ConditionTrue)
+	up.Spec.ProviderID = "k3s://up"
+	up.Spec.Taints = []corev1.Taint{{Key: "ToBeDeletedByClusterAutoscaler", Effect: corev1.TaintEffectNoSchedule}}
+	c, _ := newCluster(up, node("down", corev1.ConditionUnknown))
 	for _, tc := range []struct {
-		name          string
-		exists, ready bool
-	}{{"up", true, true}, {"down", true, false}, {"gone", false, false}} {
-		exists, ready, err := c.Node(ctx, tc.name)
-		if err != nil || exists != tc.exists || ready != tc.ready {
-			t.Errorf("Node(%s) = %v %v %v, want %v %v", tc.name, exists, ready, err, tc.exists, tc.ready)
+		name string
+		want pool.NodeInfo
+	}{
+		{"up", pool.NodeInfo{Exists: true, Ready: true, ToBeDeleted: true, ProviderID: "k3s://up"}},
+		{"down", pool.NodeInfo{Exists: true}},
+		{"gone", pool.NodeInfo{}},
+	} {
+		got, err := c.Node(ctx, tc.name)
+		if err != nil || got != tc.want {
+			t.Errorf("Node(%s) = %+v %v, want %+v", tc.name, got, err, tc.want)
 		}
 	}
 }
@@ -54,21 +64,40 @@ func TestDeleteNode(t *testing.T) {
 	}
 }
 
+func powerOffPods(t *testing.T, cs *fake.Clientset, node string) []corev1.Pod {
+	t.Helper()
+	l, err := cs.CoreV1().Pods("plugpool").List(ctx, metav1.ListOptions{LabelSelector: "app.kubernetes.io/name=plugpool-poweroff"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out []corev1.Pod
+	for _, p := range l.Items {
+		if p.Spec.NodeName == node {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
 func TestStartPowerOffPodSpec(t *testing.T) {
 	c, cs := newCluster(node("w1", corev1.ConditionTrue))
 	if err := c.StartPowerOff(ctx, "w1"); err != nil {
 		t.Fatal(err)
 	}
-	pod, err := cs.CoreV1().Pods("plugpool").Get(ctx, "plugpool-poweroff-w1", metav1.GetOptions{})
-	if err != nil {
-		t.Fatal(err)
+	pods := powerOffPods(t, cs, "w1")
+	if len(pods) != 1 {
+		t.Fatalf("%d poweroff pods", len(pods))
 	}
+	pod := pods[0]
 	s := pod.Spec
-	if s.NodeName != "w1" || !s.HostPID || s.RestartPolicy != corev1.RestartPolicyNever {
-		t.Fatalf("nodeName %q hostPID %v restart %q", s.NodeName, s.HostPID, s.RestartPolicy)
+	if !strings.HasPrefix(pod.Name, "plugpool-poweroff-w1-") || !s.HostPID || s.RestartPolicy != corev1.RestartPolicyNever {
+		t.Fatalf("name %q hostPID %v restart %q", pod.Name, s.HostPID, s.RestartPolicy)
 	}
 	if len(s.Tolerations) != 1 || s.Tolerations[0].Operator != corev1.TolerationOpExists || s.Tolerations[0].Key != "" {
 		t.Fatalf("tolerations = %v", s.Tolerations)
+	}
+	if s.ActiveDeadlineSeconds == nil || *s.ActiveDeadlineSeconds <= 0 || s.AutomountServiceAccountToken == nil || *s.AutomountServiceAccountToken {
+		t.Fatalf("activeDeadlineSeconds %v automountServiceAccountToken %v", s.ActiveDeadlineSeconds, s.AutomountServiceAccountToken)
 	}
 	ctr := s.Containers[0]
 	if ctr.SecurityContext == nil || ctr.SecurityContext.Privileged == nil || !*ctr.SecurityContext.Privileged {
@@ -78,37 +107,56 @@ func TestStartPowerOffPodSpec(t *testing.T) {
 	if !slices.Equal(ctr.Command, want) || ctr.Image != "busybox:1.37" {
 		t.Fatalf("command %v image %q", ctr.Command, ctr.Image)
 	}
-	if s.PriorityClassName != "system-node-critical" || pod.Labels["app.kubernetes.io/name"] != "plugpool-poweroff" {
-		t.Fatalf("priority %q labels %v", s.PriorityClassName, pod.Labels)
+	if s.PriorityClassName != "system-node-critical" {
+		t.Fatalf("priority %q", s.PriorityClassName)
 	}
 }
 
-func TestStartPowerOffIdempotent(t *testing.T) {
-	c, _ := newCluster(node("w1", corev1.ConditionTrue))
+func TestStartPowerOffIdempotentWhileActive(t *testing.T) {
+	c, cs := newCluster(node("w1", corev1.ConditionTrue))
 	for range 2 {
 		if err := c.StartPowerOff(ctx, "w1"); err != nil {
 			t.Fatal(err)
 		}
 	}
+	if n := len(powerOffPods(t, cs, "w1")); n != 1 {
+		t.Fatalf("%d poweroff pods, want 1", n)
+	}
 }
 
-func TestStartPowerOffReplacesFinishedPod(t *testing.T) {
+func TestStartPowerOffIgnoresFinishedPod(t *testing.T) {
 	c, cs := newCluster(node("w1", corev1.ConditionTrue))
-	old := &corev1.Pod{
-		ObjectMeta: metav1.ObjectMeta{Name: "plugpool-poweroff-w1", Namespace: "plugpool", UID: "old"},
-		Status:     corev1.PodStatus{Phase: corev1.PodSucceeded},
-	}
-	if _, err := cs.CoreV1().Pods("plugpool").Create(ctx, old, metav1.CreateOptions{}); err != nil {
-		t.Fatal(err)
-	}
 	if err := c.StartPowerOff(ctx, "w1"); err != nil {
 		t.Fatal(err)
 	}
-	pod, err := cs.CoreV1().Pods("plugpool").Get(ctx, "plugpool-poweroff-w1", metav1.GetOptions{})
-	if err != nil {
+	old := powerOffPods(t, cs, "w1")[0]
+	old.Status.Phase = corev1.PodSucceeded
+	if _, err := cs.CoreV1().Pods("plugpool").UpdateStatus(ctx, &old, metav1.UpdateOptions{}); err != nil {
 		t.Fatal(err)
 	}
-	if pod.UID == "old" || pod.Spec.NodeName != "w1" {
-		t.Fatal("a finished poweroff pod from an earlier cycle was not replaced")
+	c.now = func() time.Time { return time.Unix(1_900_000_000, 0) }
+	if err := c.StartPowerOff(ctx, "w1"); err != nil {
+		t.Fatal(err)
+	}
+	active := 0
+	for _, p := range powerOffPods(t, cs, "w1") {
+		if p.Status.Phase != corev1.PodSucceeded {
+			active++
+		}
+	}
+	if active != 1 {
+		t.Fatalf("%d new poweroff pods next to a finished one, want 1", active)
+	}
+}
+
+func TestRemovePowerOff(t *testing.T) {
+	c, cs := newCluster(node("w1", corev1.ConditionTrue), node("w2", corev1.ConditionTrue))
+	_ = c.StartPowerOff(ctx, "w1")
+	_ = c.StartPowerOff(ctx, "w2")
+	if err := c.RemovePowerOff(ctx, "w1"); err != nil {
+		t.Fatal(err)
+	}
+	if len(powerOffPods(t, cs, "w1")) != 0 || len(powerOffPods(t, cs, "w2")) != 1 {
+		t.Fatal("RemovePowerOff must delete exactly the node's poweroff pods")
 	}
 }

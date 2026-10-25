@@ -1,14 +1,17 @@
 package pool
 
 import (
+	"context"
+	"errors"
 	"slices"
 	"testing"
 	"time"
 )
 
+// running registers the node; tainted = cluster-autoscaler is deleting it.
 func running(r *rig, name string, ready bool) {
 	r.plugs[name].on = true
-	r.cluster.nodes[name] = &fakeNode{ready: ready}
+	r.cluster.nodes[name] = &fakeNode{ready: ready, tainted: true}
 }
 
 func TestDeleteHappyPath(t *testing.T) {
@@ -20,7 +23,7 @@ func TestDeleteHappyPath(t *testing.T) {
 		t.Fatal(err)
 	}
 	r.pool.Wait()
-	if got := r.log.all(); !slices.Equal(got, []string{"poweroff w1", "plug off w1", "delete node w1"}) {
+	if got := r.log.all(); !slices.Equal(got, []string{"poweroff w1", "plug off w1", "remove poweroff w1", "delete node w1"}) {
 		t.Fatalf("calls = %v", got)
 	}
 	if waited := r.clock.Now().Sub(start); waited < 2*time.Minute {
@@ -37,7 +40,7 @@ func TestDeleteDeadNode(t *testing.T) {
 	_ = r.pool.Refresh(ctx)
 	_ = r.pool.DeleteNodes(ctx, []string{"w1"})
 	r.pool.Wait()
-	if got := r.log.all(); !slices.Equal(got, []string{"plug off w1", "delete node w1"}) {
+	if got := r.log.all(); !slices.Equal(got, []string{"plug off w1", "remove poweroff w1", "delete node w1"}) {
 		t.Fatalf("calls = %v", got)
 	}
 }
@@ -50,7 +53,7 @@ func TestDeleteNeverNotReady(t *testing.T) {
 	start := r.clock.Now()
 	_ = r.pool.DeleteNodes(ctx, []string{"w1"})
 	r.pool.Wait()
-	if got := r.log.all(); !slices.Equal(got, []string{"poweroff w1", "plug off w1", "delete node w1"}) {
+	if got := r.log.all(); !slices.Equal(got, []string{"poweroff w1", "plug off w1", "remove poweroff w1", "delete node w1"}) {
 		t.Fatalf("calls = %v", got)
 	}
 	if waited := r.clock.Now().Sub(start); waited < 7*time.Minute {
@@ -83,7 +86,7 @@ func TestDeleteTwiceIsNoop(t *testing.T) {
 	}
 	close(r.cluster.gate)
 	r.pool.Wait()
-	if got := r.log.all(); !slices.Equal(got, []string{"poweroff w1", "plug off w1", "delete node w1"}) {
+	if got := r.log.all(); !slices.Equal(got, []string{"poweroff w1", "plug off w1", "remove poweroff w1", "delete node w1"}) {
 		t.Fatalf("calls = %v", got)
 	}
 }
@@ -111,7 +114,7 @@ func TestPlugOffRetries(t *testing.T) {
 	_ = r.pool.Refresh(ctx)
 	_ = r.pool.DeleteNodes(ctx, []string{"w1"})
 	r.pool.Wait()
-	if got := r.log.all(); !slices.Equal(got, []string{"poweroff w1", "plug off w1", "delete node w1"}) {
+	if got := r.log.all(); !slices.Equal(got, []string{"poweroff w1", "plug off w1", "remove poweroff w1", "delete node w1"}) {
 		t.Fatalf("calls = %v", got)
 	}
 }
@@ -132,4 +135,62 @@ func TestDeletingExcludedFromTargetSize(t *testing.T) {
 	}
 	close(r.cluster.gate)
 	r.pool.Wait()
+}
+
+func TestDeleteReadyNodeWithoutTaintAborts(t *testing.T) {
+	r := newRig("w1")
+	r.plugs["w1"].on = true
+	r.cluster.nodes["w1"] = &fakeNode{ready: true} // not being deleted by CA
+	_ = r.pool.Refresh(ctx)
+	if err := r.pool.DeleteNodes(ctx, []string{"w1"}); err != nil {
+		t.Fatal(err)
+	}
+	r.pool.Wait()
+	if got := r.log.all(); len(got) != 0 {
+		t.Fatalf("a Ready node without the deletion taint was touched: %v", got)
+	}
+	_ = r.pool.Refresh(ctx)
+	if got := states(r)["k3s://w1"]; got != Running {
+		t.Fatalf("w1 = %v, want Running", got)
+	}
+}
+
+func TestDeleteAbortsBeforePlugOffWhenUntainted(t *testing.T) {
+	r := newRig("w1")
+	r.cluster.powerOffMakesNotReady = false
+	r.cluster.powerOffUntaints = true
+	running(r, "w1", true)
+	_ = r.pool.Refresh(ctx)
+	_ = r.pool.DeleteNodes(ctx, []string{"w1"})
+	r.pool.Wait()
+	if got := r.log.all(); !slices.Equal(got, []string{"poweroff w1"}) {
+		t.Fatalf("calls = %v, want no plug off for a Ready untainted node", got)
+	}
+}
+
+func TestDeleteNodesCancelledContext(t *testing.T) {
+	r := newRig("w1")
+	running(r, "w1", true)
+	_ = r.pool.Refresh(ctx)
+	cctx, cancel := context.WithCancel(ctx)
+	cancel()
+	if err := r.pool.DeleteNodes(cctx, []string{"w1"}); err == nil {
+		t.Fatal("cancelled RPC context: no error")
+	}
+	r.pool.Wait()
+	if got := r.log.all(); len(got) != 0 {
+		t.Fatalf("calls = %v", got)
+	}
+}
+
+func TestDeleteNodeFailureKeepsRunning(t *testing.T) {
+	r := newRig("w1")
+	running(r, "w1", false)
+	r.cluster.deleteErr = errors.New("forbidden")
+	_ = r.pool.Refresh(ctx)
+	_ = r.pool.DeleteNodes(ctx, []string{"w1"})
+	r.pool.Wait()
+	if got := states(r)["k3s://w1"]; got != Running {
+		t.Fatalf("w1 = %v after a failed Node delete, want Running", got)
+	}
 }

@@ -40,12 +40,16 @@ type cluster struct {
 	nodes map[string]bool // name -> ready
 }
 
-func (c *cluster) Node(_ context.Context, n string) (bool, bool, error) {
+// Node reports every registered node as marked for deletion by
+// cluster-autoscaler; the taint guard is tested in package pool.
+func (c *cluster) Node(_ context.Context, n string) (pool.NodeInfo, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	r, ok := c.nodes[n]
-	return ok, r, nil
+	return pool.NodeInfo{Exists: ok, Ready: r, ToBeDeleted: ok, ProviderID: map[bool]string{true: "k3s://" + n}[ok]}, nil
 }
+
+func (c *cluster) RemovePowerOff(context.Context, string) error { return nil }
 func (c *cluster) DeleteNode(_ context.Context, n string) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()

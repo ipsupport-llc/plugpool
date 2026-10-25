@@ -5,6 +5,7 @@ import (
 	"errors"
 	"slices"
 	"testing"
+	"time"
 )
 
 var ctx = context.Background()
@@ -53,15 +54,68 @@ func TestPlugErrorKeepsLastState(t *testing.T) {
 	}
 }
 
-func TestRefreshErrorOnlyWhenEveryPlugFails(t *testing.T) {
+func TestRefreshNeverFailsOnPlugs(t *testing.T) {
 	r := newRig("w1", "w2")
 	r.plugs["w1"].readErr = errors.New("timeout")
-	if err := r.pool.Refresh(ctx); err != nil {
-		t.Fatalf("one failing plug: %v", err)
-	}
 	r.plugs["w2"].readErr = errors.New("timeout")
-	if err := r.pool.Refresh(ctx); err == nil {
-		t.Fatal("every plug failing: no error")
+	if err := r.pool.Refresh(ctx); err != nil {
+		t.Fatalf("plug errors must not fail Refresh (it halts cluster-autoscaler): %v", err)
+	}
+}
+
+func TestRefreshHungPlugDoesNotBlockOthers(t *testing.T) {
+	r := newRig("w1", "w2")
+	r.plugs["w1"].hang = true
+	r.plugs["w2"].on = true
+	cctx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	start := time.Now()
+	if err := r.pool.Refresh(cctx); err != nil {
+		t.Fatal(err)
+	}
+	if time.Since(start) > time.Second {
+		t.Fatalf("Refresh took %v with one hung plug", time.Since(start))
+	}
+	if got := states(r)["k3s://w2"]; got != Creating {
+		t.Fatalf("w2 = %v, want Creating", got)
+	}
+}
+
+func TestRunningKeptOnPlugError(t *testing.T) {
+	r := newRig("w1")
+	r.cluster.nodes["w1"] = &fakeNode{ready: true}
+	_ = r.pool.Refresh(ctx)
+	delete(r.cluster.nodes, "w1")
+	r.plugs["w1"].readErr = errors.New("timeout")
+	_ = r.pool.Refresh(ctx)
+	if got := states(r)["k3s://w1"]; got != Running {
+		t.Fatalf("w1 = %v, want Running kept", got)
+	}
+}
+
+func TestIncreaseSkipsUnknownAndFailingPlugs(t *testing.T) {
+	r := newRig("w1", "w2", "w3")
+	r.plugs["w1"].readErr = errors.New("unreachable") // never read: unknown
+	r.plugs["w2"].setErrs = 1                         // readable, Set fails
+	_ = r.pool.Refresh(ctx)
+	if err := r.pool.IncreaseSize(ctx, 1); err != nil {
+		t.Fatal(err)
+	}
+	if got := r.log.all(); !slices.Equal(got, []string{"plug on w3"}) {
+		t.Fatalf("calls = %v, want w3 switched on", got)
+	}
+}
+
+func TestDecreaseSkipsJustRegistered(t *testing.T) {
+	r := newRig("w1")
+	_ = r.pool.Refresh(ctx)
+	_ = r.pool.IncreaseSize(ctx, 1)
+	r.cluster.nodes["w1"] = &fakeNode{ready: true} // registered since the last Refresh
+	if err := r.pool.DecreaseTargetSize(ctx, -1); err == nil {
+		t.Fatal("no error when the only Creating node has registered")
+	}
+	if got := r.log.all(); !slices.Equal(got, []string{"plug on w1"}) {
+		t.Fatalf("calls = %v, a just-registered machine lost power", got)
 	}
 }
 
@@ -129,6 +183,9 @@ func TestNodeFor(t *testing.T) {
 	}
 	if _, ok := r.pool.NodeFor("k3s://other", "other"); ok {
 		t.Fatal("foreign node matched")
+	}
+	if _, ok := r.pool.NodeFor("rke2://w1", "w1"); ok {
+		t.Fatal("a name match with a different providerID must not count")
 	}
 }
 

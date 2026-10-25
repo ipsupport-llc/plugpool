@@ -25,10 +25,13 @@ two talk over localhost and nothing is exposed on the network.
 
 ## How a machine is powered
 
-- **Scale-up:** the plug of the first machine that is off goes on. The
-  machine is "creating" until its Node registers. If it does not register
-  within cluster-autoscaler's `--max-node-provision-time`, cluster-autoscaler
-  deletes it, which switches the plug off again.
+- **Scale-up:** the plug of the first machine that is off goes on (a plug
+  that fails is skipped for the next machine). The machine is "creating"
+  until its Node registers. If it does not register within
+  cluster-autoscaler's `--max-node-provision-time`, cluster-autoscaler
+  lowers the target size again (or deletes the instance), and plugpool
+  switches that plug off — after checking that the machine has not
+  registered in the meantime.
 - **Scale-down:** after cluster-autoscaler has drained the node, plugpool
   - starts a one-shot privileged pod on the node that runs
     `systemctl poweroff` in the host namespaces;
@@ -40,11 +43,24 @@ two talk over localhost and nothing is exposed on the network.
   A node that is already dead goes through the same steps without the
   poweroff pod.
 
+Safety rules:
+
+- plugpool only switches the plugs in its configuration.
+- A plug goes off only for a node cluster-autoscaler asked to delete or to
+  drop from the target size. A registered, Ready node without
+  cluster-autoscaler's `ToBeDeletedByClusterAutoscaler` taint is never shut
+  down or switched off, whatever the request: this is checked before the
+  shutdown and again before the plug goes off.
+- A node matches its instance by `spec.providerID`; by name only when the
+  node has no providerID. A providerID of another form is logged as a
+  configuration error.
+
 State comes from the plugs and the Node objects on every refresh, so a
-restart of plugpool loses nothing except a scale-down in progress. A plug
-that cannot be read keeps its last known state. plugpool only switches the
-plugs in its configuration, and switches a plug off only when it is asked
-to delete that node.
+restart of plugpool loses nothing except a scale-down in progress. Plugs are
+read in parallel with a short timeout; one that cannot be read keeps its
+last known state and never fails the refresh (a failed refresh stops
+cluster-autoscaler entirely). A plug never read yet is not used for
+scale-up.
 
 ## Configuration
 
@@ -83,7 +99,8 @@ workloads that should scale the pool.
 [`deploy/examples`](deploy/examples) has a complete example: namespace,
 RBAC (cluster-autoscaler's rules plus Node delete and the poweroff pods),
 configuration and the Deployment with both containers. Set a `nodeSelector`
-that keeps the pod off the machines it powers.
+that keeps the pod off the machines it powers. Raise the externalgrpc
+`grpc_timeout` (default 5s) as in the example.
 
 ## Limits
 
