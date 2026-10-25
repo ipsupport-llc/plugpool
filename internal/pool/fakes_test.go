@@ -8,6 +8,7 @@ import (
 
 	"github.com/ipsupport-llc/plugpool/internal/config"
 	"github.com/ipsupport-llc/plugpool/internal/plug"
+	resourceapi "k8s.io/api/resource/v1"
 )
 
 // log records every side effect in order, across plugs and the cluster.
@@ -84,6 +85,8 @@ type fakeCluster struct {
 	log   *log
 	mu    sync.Mutex
 	nodes map[string]*fakeNode
+	// slices: the DRA ResourceSlices each node publishes.
+	slices map[string][]resourceapi.ResourceSlice
 	// powerOffMakesNotReady: StartPowerOff turns the node NotReady.
 	powerOffMakesNotReady bool
 	// powerOffUntaints: StartPowerOff removes the deletion taint (CA gave up).
@@ -139,6 +142,12 @@ func (c *fakeCluster) StartPowerOff(_ context.Context, name string) error {
 	return nil
 }
 
+func (c *fakeCluster) ResourceSlices(_ context.Context, name string) ([]resourceapi.ResourceSlice, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.slices[name], nil
+}
+
 func (c *fakeCluster) RemovePowerOff(_ context.Context, name string) error {
 	if c.removeErr != nil {
 		c.log.add("remove poweroff failed " + name)
@@ -173,7 +182,7 @@ type rig struct {
 // newRig builds a pool of the named nodes, maxSize = len(names).
 func newRig(names ...string) *rig {
 	l := &log{}
-	r := &rig{plugs: map[string]*fakePlug{}, cluster: &fakeCluster{log: l, nodes: map[string]*fakeNode{}, powerOffMakesNotReady: true}, log: l, clock: &fakeClock{now: time.Unix(1_800_000_000, 0)}}
+	r := &rig{plugs: map[string]*fakePlug{}, cluster: &fakeCluster{log: l, nodes: map[string]*fakeNode{}, slices: map[string][]resourceapi.ResourceSlice{}, powerOffMakesNotReady: true}, log: l, clock: &fakeClock{now: time.Unix(1_800_000_000, 0)}}
 	g := config.NodeGroup{ID: "pool", MinSize: 0, MaxSize: len(names), Template: config.Template{CPU: "4", Memory: "8Gi", Pods: "110"}}
 	switches := map[string]plug.Switch{}
 	for _, n := range names {

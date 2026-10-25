@@ -17,6 +17,7 @@ import (
 	"google.golang.org/grpc/status"
 	"google.golang.org/grpc/test/bufconn"
 	corev1 "k8s.io/api/core/v1"
+	resourceapi "k8s.io/api/resource/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 )
 
@@ -36,8 +37,15 @@ func (s *sw) Set(_ context.Context, on bool) error {
 }
 
 type cluster struct {
-	mu    sync.Mutex
-	nodes map[string]bool // name -> ready
+	mu     sync.Mutex
+	nodes  map[string]bool // name -> ready
+	slices map[string][]resourceapi.ResourceSlice
+}
+
+func (c *cluster) ResourceSlices(_ context.Context, n string) ([]resourceapi.ResourceSlice, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.slices[n], nil
 }
 
 // Node reports every registered node as marked for deletion by
@@ -85,7 +93,7 @@ func setup(t *testing.T) *env {
 			{Name: "w2", Plug: config.Plug{URL: "http://plug-w2.example", Switch: "Relay"}},
 		},
 	}
-	e := &env{plugs: map[string]*sw{"w1": {}, "w2": {}}, nodes: &cluster{nodes: map[string]bool{}}}
+	e := &env{plugs: map[string]*sw{"w1": {}, "w2": {}}, nodes: &cluster{nodes: map[string]bool{}, slices: map[string][]resourceapi.ResourceSlice{}}}
 	switches := map[string]plug.Switch{"w1": e.plugs["w1"], "w2": e.plugs["w2"]}
 	e.pool = pool.New(g, config.PowerOff{Namespace: "plugpool", Image: "busybox"}, "k3s://", switches, e.nodes, instantClock{})
 
@@ -232,5 +240,35 @@ func TestOptionalRPCs(t *testing.T) {
 	}
 	if r, err := e.client.GetAvailableGPUTypes(ctx, &protos.GetAvailableGPUTypesRequest{}); err != nil || len(r.GpuTypes) != 0 {
 		t.Fatalf("GetAvailableGPUTypes = %v %v", r, err)
+	}
+}
+
+func TestTemplateNodeCarriesResourceSlices(t *testing.T) {
+	e := setup(t)
+	node := "w1"
+	e.nodes.nodes["w1"] = true
+	e.nodes.slices["w1"] = []resourceapi.ResourceSlice{{
+		Spec: resourceapi.ResourceSliceSpec{
+			Driver: "gpu.example.com", NodeName: &node,
+			Pool:    resourceapi.ResourcePool{Name: "w1", ResourceSliceCount: 1},
+			Devices: []resourceapi.Device{{Name: "gpu-0"}, {Name: "gpu-1"}},
+		},
+	}}
+	if _, err := e.client.Refresh(ctx, &protos.RefreshRequest{}); err != nil {
+		t.Fatal(err)
+	}
+	r, err := e.client.NodeGroupTemplateNodeInfo(ctx, &protos.NodeGroupTemplateNodeInfoRequest{Id: "pool"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(r.ResourceSliceBytes) != 1 {
+		t.Fatalf("%d resource slices in the template, want 1", len(r.ResourceSliceBytes))
+	}
+	s := &resourceapi.ResourceSlice{}
+	if err := s.Unmarshal(r.ResourceSliceBytes[0]); err != nil {
+		t.Fatal(err)
+	}
+	if *s.Spec.NodeName != "template-pool" || len(s.Spec.Devices) != 2 || s.Spec.Driver != "gpu.example.com" {
+		t.Fatalf("template slice = %+v", s.Spec)
 	}
 }

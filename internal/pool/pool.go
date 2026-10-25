@@ -14,6 +14,7 @@ import (
 
 	"github.com/ipsupport-llc/plugpool/internal/config"
 	"github.com/ipsupport-llc/plugpool/internal/plug"
+	resourceapi "k8s.io/api/resource/v1"
 )
 
 // NodeInfo is what the pool reads from a Node object.
@@ -36,6 +37,8 @@ type Cluster interface {
 	StartPowerOff(ctx context.Context, name string) error
 	// RemovePowerOff deletes the node's poweroff pods.
 	RemovePowerOff(ctx context.Context, name string) error
+	// ResourceSlices returns the DRA ResourceSlices the node publishes.
+	ResourceSlices(ctx context.Context, name string) ([]resourceapi.ResourceSlice, error)
 }
 
 // defaultPlugTimeout bounds one plug request made while serving an RPC;
@@ -116,9 +119,13 @@ type Pool struct {
 	// after it started reading.
 	gen     uint64
 	changed map[string]uint64
-	wg      sync.WaitGroup
-	stop    context.Context
-	cancel  context.CancelFunc
+	// snapshots: the last non-empty DRA ResourceSlices of each node, for
+	// the group's template; store persists them (may be nil).
+	snapshots map[string][]resourceapi.ResourceSlice
+	store     SliceStore
+	wg        sync.WaitGroup
+	stop      context.Context
+	cancel    context.CancelFunc
 }
 
 // New returns the pool of group g. plugs has one switch per node name.
@@ -128,8 +135,8 @@ func New(g config.NodeGroup, p config.PowerOff, prefix string, plugs map[string]
 		group: g, powerOff: p, prefix: prefix, plugs: plugs, cluster: c, clock: clk,
 		plugTimeout: defaultPlugTimeout,
 		last:        map[string]State{}, poweredOn: map[string]time.Time{}, deleting: map[string]bool{},
-		changed: map[string]uint64{},
-		stop:    stop, cancel: cancel,
+		changed: map[string]uint64{}, snapshots: map[string][]resourceapi.ResourceSlice{},
+		stop: stop, cancel: cancel,
 	}
 	for _, n := range g.Nodes {
 		pl.last[n.Name] = Unknown
@@ -152,12 +159,14 @@ func (p *Pool) Refresh(ctx context.Context) error {
 	start := p.gen
 	p.mu.Unlock()
 	type result struct {
-		name    string
-		node    NodeInfo
-		nodeErr error
-		on      bool
-		plugErr error
-		read    bool // plug was read
+		name      string
+		node      NodeInfo
+		nodeErr   error
+		on        bool
+		plugErr   error
+		read      bool // plug was read
+		slices    []resourceapi.ResourceSlice
+		slicesErr error
 	}
 	results := make([]result, len(p.group.Nodes))
 	var wg sync.WaitGroup
@@ -167,6 +176,9 @@ func (p *Pool) Refresh(ctx context.Context) error {
 			defer wg.Done()
 			r := result{name: n.Name}
 			r.node, r.nodeErr = p.cluster.Node(ctx, n.Name)
+			if r.nodeErr == nil && r.node.Exists && r.node.Ready {
+				r.slices, r.slicesErr = p.cluster.ResourceSlices(ctx, n.Name)
+			}
 			if r.nodeErr == nil && !r.node.Exists {
 				pctx, cancel := context.WithTimeout(ctx, p.plugTimeout)
 				r.on, r.plugErr = p.plugs[n.Name].State(pctx)
@@ -179,8 +191,13 @@ func (p *Pool) Refresh(ctx context.Context) error {
 	wg.Wait()
 
 	p.mu.Lock()
-	defer p.mu.Unlock()
+	snapshotsChanged := false
 	for _, r := range results {
+		if r.slicesErr != nil {
+			slog.Warn("resource slices read failed, keeping the snapshot", "node", r.name, "err", r.slicesErr)
+		} else if p.updateSnapshot(r.name, r.slices) {
+			snapshotsChanged = true
+		}
 		switch {
 		case p.changed[r.name] > start:
 			// changed while we were reading: our observation is stale
@@ -201,6 +218,20 @@ func (p *Pool) Refresh(ctx context.Context) error {
 		default:
 			p.last[r.name] = Off
 			delete(p.poweredOn, r.name)
+		}
+	}
+	var toSave map[string][]resourceapi.ResourceSlice
+	if snapshotsChanged {
+		p.warnIfUnalike()
+		if p.store != nil {
+			toSave = copySnapshots(p.snapshots)
+		}
+	}
+	store := p.store
+	p.mu.Unlock()
+	if toSave != nil {
+		if err := store.Save(ctx, toSave); err != nil {
+			slog.Warn("saving resource slice snapshots failed", "pool", p.group.ID, "err", err)
 		}
 	}
 	return nil
