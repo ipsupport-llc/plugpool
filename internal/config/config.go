@@ -160,7 +160,11 @@ func (c *Config) Validate() error {
 			// One plug powers one machine: switching it off for one node
 			// must never cut another.
 			if err == nil {
-				key := strings.ToLower(u.Scheme+"://"+u.Host) + strings.TrimSuffix(u.Path, "/") + "#" + n.Plug.Switch
+				port := u.Port()
+				if port == "" {
+					port = map[string]string{"http": "80", "https": "443"}[u.Scheme]
+				}
+				key := strings.ToLower(u.Scheme+"://"+u.Hostname()) + ":" + port + strings.TrimSuffix(u.Path, "/") + "#" + n.Plug.Switch
 				if other, dup := plugs[key]; dup {
 					errs = append(errs, fmt.Errorf("%s: nodes %s and %s use the same plug", p, other, n.Name))
 				}

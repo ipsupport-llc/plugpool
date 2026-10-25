@@ -243,3 +243,15 @@ func TestRemovePowerOffFailureBlocksReuse(t *testing.T) {
 		t.Fatalf("w1 = %v, want Running (not reusable for scale-up)", got)
 	}
 }
+
+func TestPowerOffPodRemovedWhenNodeVanishes(t *testing.T) {
+	r := newRig("w1")
+	r.cluster.powerOffDeletesNode = true
+	running(r, "w1", true)
+	_ = r.pool.Refresh(ctx)
+	_ = r.pool.DeleteNodes(ctx, []string{"w1"})
+	r.pool.Wait()
+	if !slices.Contains(r.log.all(), "remove poweroff w1") {
+		t.Fatalf("calls = %v: the poweroff pod must be removed even if the Node is gone", r.log.all())
+	}
+}

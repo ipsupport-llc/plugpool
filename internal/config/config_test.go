@@ -68,6 +68,7 @@ func TestValidate(t *testing.T) {
 		{"no namespace", "namespace: \"\"", "namespace"},
 		{"no image", "image: \"\"", "image"},
 		{"shared plug", "sharedplug", "same plug"},
+		{"shared plug default port", "sharedport", "same plug"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -93,6 +94,8 @@ func mutate(s, edit string) string {
 		return s + s[i:]
 	case "dupnode":
 		return strings.Replace(s, "worker-2, plug", "worker-1, plug", 1)
+	case "sharedport":
+		return strings.Replace(s, "http://plug-worker-2.example", "http://plug-worker-1.example:80", 1)
 	case "sharedplug":
 		return strings.Replace(s, "http://plug-worker-2.example", "http://PLUG-worker-1.example/", 1)
 	case "nodeGroups: []":

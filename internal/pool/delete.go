@@ -73,7 +73,11 @@ func (p *Pool) scaleDown(name string) {
 	if !ok {
 		return
 	}
-	if info.Exists {
+	// registered: the node existed when the sequence started, so a
+	// poweroff pod may exist and must be cleaned up even if the Node
+	// disappears on the way.
+	registered := info.Exists
+	if registered {
 		if info.Ready {
 			if err := p.cluster.StartPowerOff(ctx, name); err != nil {
 				log.Warn("poweroff pod failed, cutting power after the timeout", "err", err)
@@ -87,7 +91,7 @@ func (p *Pool) scaleDown(name string) {
 		}
 	}
 	for {
-		if info, ok = p.checkNode(ctx, log, name, "before plug off"); !ok {
+		if _, ok = p.checkNode(ctx, log, name, "before plug off"); !ok {
 			return
 		}
 		pctx, cancel := context.WithTimeout(ctx, p.plugTimeout)
@@ -103,7 +107,7 @@ func (p *Pool) scaleDown(name string) {
 		}
 	}
 	state := Off
-	if info.Exists {
+	if registered {
 		// A poweroff pod left bound to the node would shut the machine down
 		// again on its next boot: until it is gone, keep the Node and the
 		// state Running, so the machine is not picked for a scale-up.

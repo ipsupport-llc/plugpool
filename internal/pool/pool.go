@@ -104,6 +104,9 @@ type Pool struct {
 	// plugTimeout bounds each plug request made while serving an RPC.
 	plugTimeout time.Duration
 
+	// refreshMu serializes Refresh calls: an older Refresh must not apply
+	// its observations after a newer one.
+	refreshMu sync.Mutex
 	mu        sync.Mutex
 	last      map[string]State
 	poweredOn map[string]time.Time // when IncreaseSize switched a plug on
@@ -143,6 +146,8 @@ func (p *Pool) Group() config.NodeGroup { return p.group }
 // only logged: a failing Refresh would stop cluster-autoscaler entirely, so
 // one unreachable plug must not fail it.
 func (p *Pool) Refresh(ctx context.Context) error {
+	p.refreshMu.Lock()
+	defer p.refreshMu.Unlock()
 	p.mu.Lock()
 	start := p.gen
 	p.mu.Unlock()

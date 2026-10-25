@@ -88,6 +88,8 @@ type fakeCluster struct {
 	powerOffMakesNotReady bool
 	// powerOffUntaints: StartPowerOff removes the deletion taint (CA gave up).
 	powerOffUntaints bool
+	// powerOffDeletesNode: the Node disappears once the shutdown starts.
+	powerOffDeletesNode bool
 	// gate, when set, blocks StartPowerOff until closed.
 	gate chan struct{}
 	// deleteErr fails DeleteNode; removeErr fails RemovePowerOff.
@@ -129,6 +131,9 @@ func (c *fakeCluster) StartPowerOff(_ context.Context, name string) error {
 		}
 		if c.powerOffUntaints {
 			n.tainted = false
+		}
+		if c.powerOffDeletesNode {
+			delete(c.nodes, name)
 		}
 	}
 	return nil
