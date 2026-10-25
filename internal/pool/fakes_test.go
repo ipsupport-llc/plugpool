@@ -60,8 +60,10 @@ type fakeCluster struct {
 	log   *log
 	mu    sync.Mutex
 	nodes map[string]*fakeNode
-	// readyAfterPowerOff: what StartPowerOff does to the node.
+	// powerOffMakesNotReady: StartPowerOff turns the node NotReady.
 	powerOffMakesNotReady bool
+	// gate, when set, blocks StartPowerOff until closed.
+	gate chan struct{}
 }
 
 func (c *fakeCluster) Node(_ context.Context, name string) (bool, bool, error) {
@@ -83,6 +85,9 @@ func (c *fakeCluster) DeleteNode(_ context.Context, name string) error {
 }
 
 func (c *fakeCluster) StartPowerOff(_ context.Context, name string) error {
+	if c.gate != nil {
+		<-c.gate
+	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.log.add("poweroff " + name)
