@@ -57,13 +57,33 @@ func (p *Pool) TemplateSlices() []resourceapi.ResourceSlice {
 			continue
 		}
 		name := "template-" + p.group.ID
+		// Each original (driver, pool) keeps its own pool: the first pool of
+		// a driver is named after the template node, further ones get a suffix.
+		type poolKey struct{ driver, pool string }
+		names := map[poolKey]string{}
+		perDriver := map[string]int{}
+		counts := map[poolKey]int64{}
+		for _, s := range snap {
+			k := poolKey{s.Spec.Driver, s.Spec.Pool.Name}
+			counts[k]++
+			if _, ok := names[k]; !ok {
+				if n := perDriver[k.driver]; n == 0 {
+					names[k] = name
+				} else {
+					names[k] = fmt.Sprintf("%s-%d", name, n)
+				}
+				perDriver[k.driver]++
+			}
+		}
 		out := make([]resourceapi.ResourceSlice, 0, len(snap))
 		for i, s := range snap {
+			k := poolKey{s.Spec.Driver, s.Spec.Pool.Name}
 			c := s.DeepCopy()
 			c.ObjectMeta = metav1.ObjectMeta{Name: fmt.Sprintf("%s-%d", name, i)}
 			node := name
 			c.Spec.NodeName = &node
-			c.Spec.Pool.Name = name
+			c.Spec.Pool.Name = names[k]
+			c.Spec.Pool.ResourceSliceCount = counts[k]
 			out = append(out, *c)
 		}
 		return out
@@ -72,10 +92,13 @@ func (p *Pool) TemplateSlices() []resourceapi.ResourceSlice {
 }
 
 // updateSnapshot records a node's slices (p.mu held). It reports whether the
-// snapshot changed. An empty read never replaces a snapshot: the DRA driver
-// may not be up yet after a boot.
+// snapshot changed. Only a complete publication replaces a snapshot: an empty
+// read (the DRA driver not up yet after a boot) or a pool still being
+// published (fewer slices than ResourceSliceCount at its newest generation)
+// keeps the previous one.
 func (p *Pool) updateSnapshot(node string, slices []resourceapi.ResourceSlice) bool {
-	if len(slices) == 0 {
+	slices, complete := completePools(slices)
+	if len(slices) == 0 || !complete {
 		return false
 	}
 	sort.Slice(slices, func(i, j int) bool { return slices[i].Name < slices[j].Name })
@@ -114,6 +137,37 @@ func (p *Pool) warnIfUnalike() {
 	if len(seen) > 1 {
 		slog.Warn("machines of the group publish different DRA devices; cluster-autoscaler assumes they are alike", "pool", p.group.ID, "devices", counts)
 	}
+}
+
+// completePools keeps each (driver, pool)'s slices of its newest generation
+// and reports whether every pool has all of its ResourceSliceCount slices.
+func completePools(slices []resourceapi.ResourceSlice) ([]resourceapi.ResourceSlice, bool) {
+	type poolKey struct{ driver, pool string }
+	newest := map[poolKey]int64{}
+	for _, s := range slices {
+		k := poolKey{s.Spec.Driver, s.Spec.Pool.Name}
+		if g, ok := newest[k]; !ok || s.Spec.Pool.Generation > g {
+			newest[k] = s.Spec.Pool.Generation
+		}
+	}
+	var out []resourceapi.ResourceSlice
+	have := map[poolKey]int64{}
+	want := map[poolKey]int64{}
+	for _, s := range slices {
+		k := poolKey{s.Spec.Driver, s.Spec.Pool.Name}
+		if s.Spec.Pool.Generation != newest[k] {
+			continue
+		}
+		out = append(out, *s.DeepCopy())
+		have[k]++
+		want[k] = s.Spec.Pool.ResourceSliceCount
+	}
+	for k, n := range want {
+		if have[k] != n {
+			return out, false
+		}
+	}
+	return out, true
 }
 
 func copySnapshots(m map[string][]resourceapi.ResourceSlice) map[string][]resourceapi.ResourceSlice {

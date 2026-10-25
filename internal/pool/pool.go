@@ -123,9 +123,11 @@ type Pool struct {
 	// the group's template; store persists them (may be nil).
 	snapshots map[string][]resourceapi.ResourceSlice
 	store     SliceStore
-	wg        sync.WaitGroup
-	stop      context.Context
-	cancel    context.CancelFunc
+	// dirty: snapshots changed and not yet saved (retried every Refresh).
+	dirty  bool
+	wg     sync.WaitGroup
+	stop   context.Context
+	cancel context.CancelFunc
 }
 
 // New returns the pool of group g. plugs has one switch per node name.
@@ -220,18 +222,23 @@ func (p *Pool) Refresh(ctx context.Context) error {
 			delete(p.poweredOn, r.name)
 		}
 	}
-	var toSave map[string][]resourceapi.ResourceSlice
 	if snapshotsChanged {
 		p.warnIfUnalike()
-		if p.store != nil {
-			toSave = copySnapshots(p.snapshots)
-		}
+		p.dirty = true
+	}
+	var toSave map[string][]resourceapi.ResourceSlice
+	if p.dirty && p.store != nil {
+		toSave = copySnapshots(p.snapshots)
 	}
 	store := p.store
 	p.mu.Unlock()
 	if toSave != nil {
 		if err := store.Save(ctx, toSave); err != nil {
-			slog.Warn("saving resource slice snapshots failed", "pool", p.group.ID, "err", err)
+			slog.Warn("saving resource slice snapshots failed, retrying next refresh", "pool", p.group.ID, "err", err)
+		} else {
+			p.mu.Lock()
+			p.dirty = false
+			p.mu.Unlock()
 		}
 	}
 	return nil

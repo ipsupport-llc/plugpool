@@ -3,7 +3,7 @@ package kube
 import (
 	"context"
 	"encoding/json"
-	"fmt"
+	"log/slog"
 
 	"github.com/ipsupport-llc/plugpool/internal/pool"
 	corev1 "k8s.io/api/core/v1"
@@ -51,7 +51,8 @@ func (s *sliceStore) Load(ctx context.Context) (map[string][]resourceapi.Resourc
 	for node, v := range cm.Data {
 		var sl []resourceapi.ResourceSlice
 		if err := json.Unmarshal([]byte(v), &sl); err != nil {
-			return nil, fmt.Errorf("%s key %s: %w", sliceConfigMap, node, err)
+			slog.Warn("skipping unreadable resource slice snapshot", "configmap", sliceConfigMap, "node", node, "err", err)
+			continue
 		}
 		out[node] = sl
 	}
@@ -61,7 +62,12 @@ func (s *sliceStore) Load(ctx context.Context) (map[string][]resourceapi.Resourc
 func (s *sliceStore) Save(ctx context.Context, snapshots map[string][]resourceapi.ResourceSlice) error {
 	data := map[string]string{}
 	for node, sl := range snapshots {
-		b, err := json.Marshal(sl)
+		// Name and spec only: server metadata is noise and costs space.
+		bare := make([]resourceapi.ResourceSlice, len(sl))
+		for i, s := range sl {
+			bare[i] = resourceapi.ResourceSlice{ObjectMeta: metav1.ObjectMeta{Name: s.Name}, Spec: s.Spec}
+		}
+		b, err := json.Marshal(bare)
 		if err != nil {
 			return err
 		}

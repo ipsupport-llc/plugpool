@@ -1,6 +1,7 @@
 package kube
 
 import (
+	"strings"
 	"testing"
 
 	resourceapi "k8s.io/api/resource/v1"
@@ -75,5 +76,37 @@ func TestSliceStoreSaveKeepsOtherNodes(t *testing.T) {
 	}
 	if len(got) != 2 {
 		t.Fatalf("after saves by two groups: %d nodes, want 2", len(got))
+	}
+}
+
+func TestSliceStoreSkipsCorruptKey(t *testing.T) {
+	c, cs := newCluster()
+	if err := c.SliceStore().Save(ctx, map[string][]resourceapi.ResourceSlice{"w1": {*slice("a", "w1")}}); err != nil {
+		t.Fatal(err)
+	}
+	cm, _ := cs.CoreV1().ConfigMaps("plugpool").Get(ctx, "plugpool-template-slices", metav1.GetOptions{})
+	cm.Data["w2"] = "{not json"
+	if _, err := cs.CoreV1().ConfigMaps("plugpool").Update(ctx, cm, metav1.UpdateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	got, err := c.SliceStore().Load(ctx)
+	if err != nil || len(got) != 1 {
+		t.Fatalf("Load with one corrupt key = %v, %v; want w1 only", got, err)
+	}
+}
+
+func TestSliceStoreKeepsOnlyNameAndSpec(t *testing.T) {
+	c, cs := newCluster()
+	s := slice("a", "w1")
+	s.UID, s.ResourceVersion = "u1", "9"
+	s.ManagedFields = []metav1.ManagedFieldsEntry{{Manager: "kubelet"}}
+	if err := c.SliceStore().Save(ctx, map[string][]resourceapi.ResourceSlice{"w1": {*s}}); err != nil {
+		t.Fatal(err)
+	}
+	cm, _ := cs.CoreV1().ConfigMaps("plugpool").Get(ctx, "plugpool-template-slices", metav1.GetOptions{})
+	for _, bad := range []string{"u1", "kubelet", "resourceVersion"} {
+		if strings.Contains(cm.Data["w1"], bad) {
+			t.Fatalf("stored metadata %q: %s", bad, cm.Data["w1"])
+		}
 	}
 }

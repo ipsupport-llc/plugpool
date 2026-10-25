@@ -128,3 +128,69 @@ func TestSnapshotsPersisted(t *testing.T) {
 		t.Fatalf("snapshot not loaded from the store: %+v", got)
 	}
 }
+
+func poolSlice(node, pool string, gen, count int64, devices ...string) resourceapi.ResourceSlice {
+	s := gpuSlice(node, 0)
+	s.Name = node + "-" + pool + "-" + string(rune('0'+gen))
+	s.Spec.Pool = resourceapi.ResourcePool{Name: pool, Generation: gen, ResourceSliceCount: count}
+	for _, d := range devices {
+		s.Spec.Devices = append(s.Spec.Devices, resourceapi.Device{Name: d})
+	}
+	return s
+}
+
+func TestTemplateKeepsDistinctPoolsOfADriver(t *testing.T) {
+	r := newRig("w1")
+	r.cluster.nodes["w1"] = &fakeNode{ready: true}
+	r.cluster.slices["w1"] = []resourceapi.ResourceSlice{poolSlice("w1", "a", 1, 1, "x"), poolSlice("w1", "b", 1, 1, "y")}
+	_ = r.pool.Refresh(ctx)
+	got := r.pool.TemplateSlices()
+	if len(got) != 2 || got[0].Spec.Pool.Name == got[1].Spec.Pool.Name {
+		t.Fatalf("two pools of one driver must stay two pools: %+v", got)
+	}
+	for _, s := range got {
+		if s.Spec.Pool.ResourceSliceCount != 1 {
+			t.Fatalf("pool %s ResourceSliceCount = %d, want 1", s.Spec.Pool.Name, s.Spec.Pool.ResourceSliceCount)
+		}
+	}
+}
+
+func TestIncompletePublicationDoesNotReplaceSnapshot(t *testing.T) {
+	r := newRig("w1")
+	r.cluster.nodes["w1"] = &fakeNode{ready: true}
+	full := []resourceapi.ResourceSlice{poolSlice("w1", "w1", 1, 2, "a"), poolSlice("w1", "w1", 1, 2, "b")}
+	r.cluster.slices["w1"] = full
+	_ = r.pool.Refresh(ctx)
+	// The driver restarts and has published only one of two slices so far.
+	r.cluster.slices["w1"] = []resourceapi.ResourceSlice{poolSlice("w1", "w1", 2, 2, "a")}
+	_ = r.pool.Refresh(ctx)
+	if got := r.pool.TemplateSlices(); len(got) != 2 {
+		t.Fatalf("an incomplete publication replaced the snapshot: %d slices", len(got))
+	}
+}
+
+type failingStore struct {
+	memStore
+	fail int
+}
+
+func (f *failingStore) Save(ctx context.Context, s map[string][]resourceapi.ResourceSlice) error {
+	if f.fail > 0 {
+		f.fail--
+		return context.DeadlineExceeded
+	}
+	return f.memStore.Save(ctx, s)
+}
+
+func TestFailedSaveIsRetried(t *testing.T) {
+	r := newRig("w1")
+	st := &failingStore{fail: 1}
+	r.pool.UseSliceStore(st)
+	r.cluster.nodes["w1"] = &fakeNode{ready: true}
+	r.cluster.slices["w1"] = []resourceapi.ResourceSlice{gpuSlice("w1", 2)}
+	_ = r.pool.Refresh(ctx) // save fails
+	_ = r.pool.Refresh(ctx) // unchanged snapshot: must retry
+	if st.saves != 1 || len(st.saved["w1"]) != 1 {
+		t.Fatalf("snapshot not saved after a failed save: saves=%d", st.saves)
+	}
+}

@@ -68,6 +68,7 @@ func run(ctx context.Context, cfgPath, kubeconfig string) error {
 	user, pass := os.Getenv("PLUGPOOL_PLUG_USERNAME"), os.Getenv("PLUGPOOL_PLUG_PASSWORD")
 	httpc := &http.Client{Timeout: 10 * time.Second}
 
+	store := cluster.SliceStore()
 	pools := map[string]*pool.Pool{}
 	for _, g := range cfg.NodeGroups {
 		switches := map[string]plug.Switch{}
@@ -76,9 +77,9 @@ func run(ctx context.Context, cfgPath, kubeconfig string) error {
 		}
 		p := pool.New(g, cfg.PowerOff, cfg.ProviderIDPrefix, switches, cluster, pool.RealClock{})
 		// DRA devices of machines seen before, for templates while they are off.
-		if err := p.LoadSlices(ctx, cluster.SliceStore()); err != nil {
+		if err := p.LoadSlices(ctx, store); err != nil {
 			slog.Warn("loading resource slice snapshots failed", "group", g.ID, "err", err)
-			p.UseSliceStore(cluster.SliceStore())
+			p.UseSliceStore(store)
 		}
 		if err := p.Refresh(ctx); err != nil {
 			slog.Warn("initial refresh failed", "group", g.ID, "err", err)
