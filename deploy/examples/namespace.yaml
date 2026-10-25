@@ -1,0 +1,8 @@
+# cluster-autoscaler, plugpool and the one-shot poweroff pods share this
+# namespace. The poweroff pods are privileged with host PID.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: plugpool
+  labels:
+    pod-security.kubernetes.io/enforce: privileged

@@ -1,0 +1,43 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: plugpool
+  namespace: plugpool
+data:
+  # cluster-autoscaler's externalgrpc cloud config: plugpool is a sidecar
+  # in the same pod, so plain gRPC on localhost.
+  # grpc_timeout above the default 5s: a Refresh reads every plug.
+  cloud-config.yaml: |
+    address: 127.0.0.1:8086
+    grpc_timeout: 15s
+  plugpool.yaml: |
+    listen: 127.0.0.1:8086
+    powerOff:
+      namespace: plugpool
+      image: busybox:1.37.0
+      notReadyTimeout: 5m
+      grace: 2m
+    nodeGroups:
+      - id: workers
+        minSize: 0
+        maxSize: 2
+        template:
+          cpu: "24"
+          memory: 64Gi
+          labels:
+            example.com/pool: workers
+        nodes:
+          - name: worker-1
+            plug: { url: "http://plug-worker-1.example", switch: "Relay" }
+          - name: worker-2
+            plug: { url: "http://plug-worker-2.example", switch: "Relay" }
+---
+# Web server credentials of the plugs (ESPHome `web_server: auth:`).
+apiVersion: v1
+kind: Secret
+metadata:
+  name: plugpool-plugs
+  namespace: plugpool
+stringData:
+  username: admin
+  password: change-me
