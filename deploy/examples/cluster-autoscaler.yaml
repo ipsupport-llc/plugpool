@@ -1,0 +1,64 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cluster-autoscaler
+  namespace: plugpool
+  labels:
+    app.kubernetes.io/name: cluster-autoscaler
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: cluster-autoscaler
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: cluster-autoscaler
+    spec:
+      serviceAccountName: cluster-autoscaler
+      # Must run on a node that can reach the plugs and is never scaled down.
+      # nodeSelector:
+      #   example.com/pool: system
+      terminationGracePeriodSeconds: 60
+      containers:
+        - name: cluster-autoscaler
+          image: registry.k8s.io/autoscaling/cluster-autoscaler:v1.36.1
+          command:
+            - ./cluster-autoscaler
+            - --cloud-provider=externalgrpc
+            - --cloud-config=/etc/plugpool/cloud-config.yaml
+            - --namespace=plugpool
+            - --scale-down-unneeded-time=30m
+            - --scale-down-delay-after-add=30m
+            - --max-node-provision-time=10m
+            - --skip-nodes-with-system-pods=false
+            - --v=2
+          resources:
+            requests: { cpu: 50m, memory: 128Mi }
+            limits: { cpu: 500m, memory: 512Mi }
+          volumeMounts:
+            - { name: config, mountPath: /etc/plugpool, readOnly: true }
+        - name: plugpool
+          image: ghcr.io/ipsupport-llc/plugpool:0.1.0
+          args: [--config=/etc/plugpool/plugpool.yaml]
+          env:
+            - name: PLUGPOOL_PLUG_USERNAME
+              valueFrom: { secretKeyRef: { name: plugpool-plugs, key: username } }
+            - name: PLUGPOOL_PLUG_PASSWORD
+              valueFrom: { secretKeyRef: { name: plugpool-plugs, key: password } }
+          resources:
+            requests: { cpu: 10m, memory: 32Mi }
+            limits: { cpu: 200m, memory: 128Mi }
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            capabilities: { drop: [ALL] }
+          volumeMounts:
+            - { name: config, mountPath: /etc/plugpool, readOnly: true }
+      volumes:
+        - name: config
+          configMap:
+            name: plugpool
