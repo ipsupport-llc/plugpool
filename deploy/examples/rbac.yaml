@@ -78,7 +78,8 @@ subjects:
     name: cluster-autoscaler
     namespace: plugpool
 ---
-# cluster-autoscaler's status ConfigMap, and plugpool's poweroff pods.
+# cluster-autoscaler's status ConfigMap, plugpool's poweroff pods and its
+# ConfigMap of DRA device snapshots.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
@@ -90,7 +91,7 @@ rules:
     verbs: [create]
   - apiGroups: [""]
     resources: [configmaps]
-    resourceNames: [cluster-autoscaler-status]
+    resourceNames: [cluster-autoscaler-status, plugpool-template-slices]
     verbs: [delete, get, update]
   - apiGroups: [""]
     resources: [pods]

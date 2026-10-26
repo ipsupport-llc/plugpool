@@ -107,10 +107,24 @@ configuration and the Deployment with both containers. Set a `nodeSelector`
 that keeps the pod off the machines it powers. Raise the externalgrpc
 `grpc_timeout` (default 5s) as in the example.
 
+## DRA devices (GPUs) in the template
+
+To scale up from zero for pods with ResourceClaims, cluster-autoscaler must
+know which devices a machine that is off would publish. plugpool records the
+DRA ResourceSlices of each machine while it is up (the last non-empty set,
+kept across power-offs in ConfigMap `plugpool-template-slices` in the
+poweroff namespace) and returns them, renamed to the template node, with
+the group's template. Nothing to configure; a machine must have been up once
+with its DRA driver running.
+
+- Needs cluster-autoscaler with ResourceSlices in externalgrpc templates
+  (1.37+); older versions ignore them.
+- cluster-autoscaler assumes the machines of a group are alike: the template
+  uses the first machine (in config order) with a snapshot, and plugpool
+  logs a warning when the machines publish different devices.
+
 ## Limits
 
-- No GPU or DRA devices in the template: a pending pod that needs a device
-  does not trigger a scale-up.
 - One replica. A scale-down in progress when the pod stops is not resumed;
   cluster-autoscaler then sees an unready node and deletes it again later.
 

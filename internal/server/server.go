@@ -172,5 +172,16 @@ func (s *Server) NodeGroupTemplateNodeInfo(_ context.Context, req *protos.NodeGr
 	if err != nil {
 		return nil, status.Error(codes.Internal, fmt.Sprintf("marshal template node: %v", err))
 	}
-	return &protos.NodeGroupTemplateNodeInfoResponse{NodeBytes: b}, nil
+	// The DRA devices a new machine would publish (snapshots of the group's
+	// machines). cluster-autoscaler 1.37+ uses them to scale up for pods with
+	// ResourceClaims; older versions ignore the field.
+	resp := &protos.NodeGroupTemplateNodeInfoResponse{NodeBytes: b}
+	for _, s := range p.TemplateSlices() {
+		sb, err := s.Marshal()
+		if err != nil {
+			return nil, status.Error(codes.Internal, fmt.Sprintf("marshal template resource slice: %v", err))
+		}
+		resp.ResourceSliceBytes = append(resp.ResourceSliceBytes, sb)
+	}
+	return resp, nil
 }
